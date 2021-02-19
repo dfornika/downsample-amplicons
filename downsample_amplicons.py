@@ -1,314 +1,271 @@
 #!/usr/bin/env python
 
-# Adapted from artic `align_trim.py`, Written by Nick Loman
-# https://github.com/artic-network/fieldbioinformatics/blob/master/artic/align_trim.py
-
 import argparse
+import csv
 import json
-import pandas as pd
-import pysam
 import re
 import sys
 
-from copy import copy
+import pysam
+
 from collections import defaultdict
-from operator import itemgetter
 
-def getPrimerDirection(primerID):
-    """Infer the primer direction based on it's ID containing LEFT/RIGHT
-    Taken from: https://github.com/artic-network/fieldbioinformatics/blob/master/artic/vcftagprimersites.py
-    Parameters
-    ----------
-    primerID : string
-        The primer ID from the 4th field of the primer scheme
+
+def merge_primers(p1, p2):
+    try:
+        assert p1['direction'] == p2['direction']
+    except AssertionError as e:
+        err_message = "Error parsing bed file. primers " + p1['primer_id'] + " and " + p2['primer_id'] + " not in same direction, cannot be merged"
+        print(err_message, file=sys.stderr)
+        sys.exit(1)
+    if p1['direction'] == '+':
+        if p1['start'] < p2['start']:
+            merged_primer = p1
+        else:
+            merged_primer = p2
+    elif p1['direction'] == '-':
+        if p1['end'] > p2['end']:
+            merged_primer = p1
+        else:
+            merged_primer = p2
+
+    return merged_primer
+
+
+def read_bed_file(bed_file_path):
     """
-    if 'LEFT' in primerID:
-        return '+'
-    elif 'RIGHT':
-        return '-'
-    else:
-        print("LEFT/RIGHT must be specified in Primer ID", file=sys.stderr)
-        raise SystemExit(1)
-
-
-def read_bed_file(fn):
-    """Parses a bed file and collapses alts into canonical primer sites
-    Taken from: https://github.com/artic-network/fieldbioinformatics/blob/master/artic/vcftagprimersites.py
-    Parameters
-    ----------
-    fn : str
-        The bedfile to parse
-    Returns
-    -------
-    list
-        A list of dictionaries, where each dictionary contains a row of the parsed bedfile.
-        The available dictionary keys are - chrom, start, end, primer_id, pool_name, direction
-        eg:
-        [
-          {
-              "chrom": "MN908947.3",
-              "start": 30,
-              "end": 54,
-              "primer_id": "nCoV-2019_1_LEFT",
-              "pool_name": "1",
-              "direction": "+"
-          },
-          {
-              "chrom": "MN908947.3",
-              "start": 1183,
-              "end": 1205,
-              "primer_id": "nCoV-2019_1_RIGHT",
-              "pool_name": "1",
-              "direction": "-"
-          },
-          {
-              "chrom": "MN908947.3",
-              "start": 1100,
-              "end": 1128,
-              "primer_id": "nCoV-2019_2_LEFT",
-              "pool_name": "2",
-              "direction": "+"
-          },
-          ...
-        ]
+          { "nCoV-2019_1_LEFT": {
+                                  "chrom": "MN908947.3",
+                                  "start": 30,
+                                  "end": 54,
+                                  "primer_id": "nCoV-2019_1_LEFT",
+                                  "pool_name": "1",
+                                  "direction": "+"
+                                 },
+            "nCoV-2019_1_RIGHT": {
+                                   "chrom": "MN908947.3",
+                                   "start": 1183,
+                                   "end": 1205,
+                                   "primer_id": "nCoV-2019_1_RIGHT",
+                                   "pool_name": "1",
+                                   "direction": "-"
+                                 },
+            ...
+          }
     """
+    fieldnames = [
+        'chrom',
+        'start',
+        'end',
+        'primer_id',
+        'pool_name',
+        'direction'
+    ]
+    int_fields = [
+        'start',
+        'end',
+    ]
+    primers = {}
+    with open(bed_file_path, 'r') as f:
+        reader = csv.DictReader(f, fieldnames=fieldnames, dialect='excel-tab')
+        for row in reader:
+            for field in int_fields:
+                row[field] = int(row[field])
+            if re.search('_alt', row['primer_id']):
+                primer_id = re.match('(.+)_alt', row['primer_id']).group(1)
+            else:
+                primer_id = row['primer_id']
+            if all([not primer_id == primer_key for primer_key in primers.keys()]):
+                primers[primer_id] = row
+            else:
+                existing_primer = primers[primer_id]
+                merged_primer = merge_primers(existing_primer, row)
+                merged_primer['primer_id'] = primer_id
+                primers[primer_id] = merged_primer
 
-    # read the primer scheme into a pandas dataframe and run type, length and null checks
-    primers = pd.read_csv(fn, sep='\t', header=None,
-                          names=['chrom', 'start', 'end',
-                                 'primer_id', 'pool_name'],
-                          dtype={'chrom': str, 'start': int, 'end': int,
-                                 'primer_id': str, 'pool_name': str},
-                          usecols=(0, 1, 2, 3, 4),
-                          skiprows=0)
-    if len(primers.index) < 1:
-        print("primer scheme file is empty", file=sys.stderr)
-        raise SystemExit(1)
-    if primers.isnull().sum().sum():
-        print("malformed primer scheme file", file=sys.stderr)
-        raise SystemExit(1)
-
-    # compute the direction
-    primers['direction'] = primers.apply(
-        lambda row: getPrimerDirection(row.primer_id), axis=1)
-
-    # separate alt primers into a new dataframe
-    altFilter = primers['primer_id'].str.contains('_alt')
-    alts = pd.DataFrame(
-        columns=('chrom', 'start', 'end', 'primer_id', 'pool_name', 'direction'))
-    alts = pd.concat([alts, primers[altFilter]])
-    primers = primers.drop(primers[altFilter].index.values)
-
-    # convert the primers dataframe to dictionary, indexed by primer_id
-    #  - verify_integrity is used to prevent duplicate primer_ids being processed
-    bedFile = primers.set_index('primer_id', drop=False,
-                                verify_integrity=True).T.to_dict()
-
-    # if there were no alts, return the bedfile as a list of dicts
-    if len(alts.index) == 0:
-        return list(bedFile.values())
-
-    # merge alts
-    for _, row in alts.iterrows():
-        primerID = row['primer_id'].split('_alt')[0]
-
-        # check the bedFile if another version of this primer exists
-        if primerID not in bedFile:
-
-            # add to the bed file and continue
-            bedFile[primerID] = row.to_dict()
-            continue
-
-        # otherwise, we've got a primer ID we've already seen so merge the alt
-        mergedSite = merge_sites(bedFile[primerID], row)
-
-        # update the bedFile
-        bedFile[primerID] = mergedSite
-
-    # return the bedFile as a list
-    return [value for value in bedFile.values()]
+    return primers
 
 
 def midpoint(start, end):
+    """
+    Find the midpoint between two loci
+    returns: int
+    """
     mid = round(start + ((end - start) / 2))
     return mid
 
 
-def get_amplicon_midpoints(parsed_bed):
+def get_initial_amplicon_checkpoints(parsed_bed):
     """
+    input: { "nCoV-2019_1_LEFT": {
+                                  "chrom": "MN908947.3",
+                                  "start": 30,
+                                  "end": 54,
+                                  "primer_id": "nCoV-2019_1_LEFT",
+                                  "pool_name": "1",
+                                  "direction": "+"
+                                 },
+            "nCoV-2019_1_RIGHT": {
+                                   "chrom": "MN908947.3",
+                                   "start": 1183,
+                                   "end": 1205,
+                                   "primer_id": "nCoV-2019_1_RIGHT",
+                                   "pool_name": "1",
+                                   "direction": "-"
+                                 },
+            ...
+          }
     returns: {
-               "nCoV-2019_1": {
-                   "start": 30,
-                   "midpoints": [
-                       618
-                   ],
-                   "end": 1205
-               },
-               "nCoV-2019_2": {
-                   "start": 1100,
-                   "midpoints": [
-                       1683
-                   ],
-                   "end": 2266
-               },
+               "nCoV-2019_1": [64, 618, 1173],
+               "nCoV-2019_2": [1138, 1683, 2234],
                ...
              }
     """
-    amplicon_midpoints = {}
-    for primer in parsed_bed:
-        amplicon_id = re.match("(.+)_LEFT", primer['primer_id'])
+    amplicon_checkpoints = {}
+    for primer_id, primer in parsed_bed.items():
+        amplicon_id = re.match("(.+)_LEFT", primer_id)
         if amplicon_id:
-            amplicon_midpoints[amplicon_id.group(1)] = {}
+            amplicon_checkpoints[amplicon_id.group(1)] = {}
 
-    for amplicon_id in amplicon_midpoints.keys():
+    for amplicon_id in amplicon_checkpoints:
         left_primer_id = amplicon_id + "_LEFT"
         right_primer_id = amplicon_id + "_RIGHT"
-        left_primer = list(filter(lambda p: p['primer_id'] == left_primer_id, parsed_bed))[0]
-        right_primer = list(filter(lambda p: p['primer_id'] == right_primer_id, parsed_bed))[0]
-        amplicon_start = left_primer['start']
-        amplicon_end = right_primer['end']
+        left_primer = parsed_bed[left_primer_id]
+        right_primer = parsed_bed[right_primer_id]
+        # consider ends of amplicon to be inner ends of primers
+        amplicon_start = left_primer['end']
+        amplicon_end = right_primer['start']
         amplicon_midpoint = midpoint(amplicon_start, amplicon_end)
-        amplicon_midpoints[amplicon_id]['start'] = amplicon_start
-        amplicon_midpoints[amplicon_id]['midpoints'] = [amplicon_midpoint]
-        amplicon_midpoints[amplicon_id]['end'] = amplicon_end
+        # add a 10-base buffer inside the ends of the primers to define our first and last checkpoints
+        amplicon_checkpoints[amplicon_id] = [(amplicon_start + 10), amplicon_midpoint, (amplicon_end - 10)]
     
-    return amplicon_midpoints
+    return amplicon_checkpoints
 
-def subdivide_amplicon_midpoints(amplicon_midpoints):
+
+def subdivide_amplicon_checkpoints(amplicon_checkpoints):
     """
+    input: [64, 618, 1173]
+    output: [64, 341, 618, 896, 1173]
     """
-    new_amplicon_midpoints = {}
-    for amplicon_id in amplicon_midpoints:
-        amplicon_start = amplicon_midpoints[amplicon_id]['start']
-        amplicon_end = amplicon_midpoints[amplicon_id]['end']
+    new_amplicon_checkpoints = []
+    for idx in range(len(amplicon_checkpoints)):
+        try:
+            new_checkpoint = midpoint(amplicon_checkpoints[idx], amplicon_checkpoints[idx + 1])
+            new_amplicon_checkpoints.append(new_checkpoint)
+        except IndexError as e:
+            pass
 
-        original_points = [amplicon_start] + amplicon_midpoints[amplicon_id]['midpoints'] + [amplicon_end]
-
-        #first_midpoint = amplicon_midpoints[amplicon_id]['midpoints'][0]
-#
-#        if len(amplicon_midpoints[amplicon_id]['midpoints']) > 2:
-#            internal_midpoints = amplicon_midpoints[amplicon_id]['midpoints'][1:-1]
-#        else:
-#            internal_midpoints = amplicon_midpoints[amplicon_id]['midpoints']
-#
-#        last_midpoint = amplicon_midpoints[amplicon_id]['midpoints'][-1]
-#
-#        new_first_midpoint = midpoint(amplicon_start, first_midpoint)
-#
-        new_midpoints = []
-        for idx in range(len(original_points)):
-            try:
-                new_midpoint = midpoint(original_points[idx], original_points[idx + 1])
-                new_midpoints.append(new_midpoint)
-            except IndexError as e:
-                pass
-
-        new_midpoints = original_points[1:-1] + new_midpoints
-        new_midpoints.sort()
+        all_checkpoints = amplicon_checkpoints + new_amplicon_checkpoints
+        all_checkpoints.sort()
         
-        new_amplicon_midpoints[amplicon_id] = { 'start': amplicon_start,
-                                                'midpoints': new_midpoints,
-                                                'end': amplicon_end }
-    return new_amplicon_midpoints
+    return all_checkpoints
 
 
-def find_primer(bed, pos, direction):
-    """Given a reference position and a direction of travel, walk out and find the nearest primer site.
-    Parameters
-    ----------
-    bed : list
-        A list of dictionaries, where each dictionary contains a row of bedfile data
-    pos : int
-        The position in the reference sequence to start from
-    direction : string
-        The direction to search along the reference sequence
-    Returns
-    -------
-    tuple
-        The offset, distance and bed entry for the closest primer to the query position. eg:
-        [8, -8, {"chrom": "MN908947.3", "start": 30, "end": 54, "primer_id": "nCoV-2019_1_LEFT", "pool_name": "nCoV-2019_1", "direction": "+"}]
-        [1010, -1010, {"chrom": "MN908947.3", "start": 28677, "end": 28699, "primer_id": "nCoV-2019_29_LEFT", "pool_name": "nCoV-2019_1", "direction": "+"}]
+def read_pair_generator(bam, region_string=None):
     """
-    
-
-    if direction == '+':
-        closest = min([(abs(p['start'] - pos), p['start'] - pos, p)
-                       for p in bed if p['direction'] == direction], key=itemgetter(0))
-    else:
-        closest = min([(abs(p['end'] - pos), p['end'] - pos, p)
-                       for p in bed if p['direction'] == direction], key=itemgetter(0))
-    return closest
+    from: https://www.biostars.org/p/306041/#332022
+    Generate read pairs in a BAM file or within a region string.
+    Reads are added to read_dict until a pair is found.
+    """
+    read_dict = defaultdict(lambda: [None, None])
+    for read in bam.fetch(region=region_string):
+        if not read.is_proper_pair or read.is_secondary or read.is_supplementary:
+            continue
+        qname = read.query_name
+        if qname not in read_dict:
+            if read.is_read1:
+                read_dict[qname][0] = read
+            else:
+                read_dict[qname][1] = read
+        else:
+            if read.is_read1:
+                yield read, read_dict[qname][1]
+            else:
+                yield read_dict[qname][0], read
+            del read_dict[qname]
 
 
 def main(args):
     """
     """
-    # prepare the report outfile
-    if args.report:
-        reportfh = open(args.report, "w")
-        print("QueryName\tReferenceStart\tReferenceEnd\tPrimerPair\tPrimer1\tPrimer1Start\tPrimer2\tPrimer2Start\tIsSecondary\tIsSupplementary\tStart\tEnd\tCorrectlyPaired", file=reportfh)
-
-    # set up a counter to track amplicon abundance
-    counter = defaultdict(int)
 
     # open the primer scheme and get the pools
-    bed = read_bed_file(args.bedfile)
-    # print(json.dumps(bed))
+    bed = read_bed_file(args.bed)
+    
+    amplicon_checkpoints = get_initial_amplicon_checkpoints(bed)
 
-    amplicon_midpoints = get_amplicon_midpoints(bed)
+    for _ in range(args.amplicon_subdivisions - 1):
+        for amplicon_id in amplicon_checkpoints:
+            amplicon_checkpoints[amplicon_id] = subdivide_amplicon_checkpoints(amplicon_checkpoints[amplicon_id])
+    
+    genome_checkpoints = []
+    for checkpoints in amplicon_checkpoints.values():
+        genome_checkpoints.extend(checkpoints)
+    genome_checkpoints.sort()
 
-    for _ in range(args.num_amplicon_subdivisions - 1):
-        amplicon_midpoints = subdivide_amplicon_midpoints(amplicon_midpoints)
-
-    checkpoints = []
-    for amplicon_id in amplicon_midpoints.keys():
-        checkpoints.append(amplicon_midpoints[amplicon_id]['start'])
-        checkpoints.extend(amplicon_midpoints[amplicon_id]['midpoints'])
-        checkpoints.append(amplicon_midpoints[amplicon_id]['end'])
-    checkpoints.sort()
-
-    required_depth_achieved = [False] * len(checkpoints)
-        
+    required_depth_achieved = [False] * len(genome_checkpoints)
+    
     depths = [0] * 30000
 
-    # open the input SAM file and process read groups
-    infile = pysam.AlignmentFile("-", "rb")
+    infile = pysam.AlignmentFile(args.bam, "rb")
     bam_header = infile.header.copy().to_dict()
 
-    # prepare the alignment outfile
     outfile = pysam.AlignmentFile("-", "wh", header=bam_header)
 
+    reads_processed = 0
+    reads_written = 0
+    reads_discarded = 0
 
-    # iterate over the alignment segments in the input SAM file
-    for segment in infile:
-        checkpoints_under_segment = list(filter(lambda cp: segment.reference_start <= cp and segment.reference_end >= cp, checkpoints))
-        checkpoints_achieved_required_depth = [True if depths[checkpoint] >= args.depth else False for checkpoint in checkpoints_under_segment]
+    for segment, mate_segment in read_pair_generator(infile):
+        if segment.mapping_quality < args.mapping_quality:
+            continue
+        if not segment.is_proper_pair:
+            continue
+        if segment.is_unmapped or segment.is_supplementary:
+            continue
+        if not segment.is_paired or segment.mate_is_unmapped:
+            continue
+
+        checkpoints_under_segment = list(filter(lambda cp: segment.reference_start <= cp and segment.reference_end >= cp, genome_checkpoints))
+        checkpoints_under_mate_segment = list(filter(lambda cp: mate_segment.reference_start <= cp and mate_segment.reference_end >= cp, genome_checkpoints))
+        checkpoints_under_both_segments = checkpoints_under_segment + checkpoints_under_mate_segment
+        checkpoint_depths = [depths[checkpoint] for checkpoint in checkpoints_under_both_segments]
+        checkpoints_achieved_required_depth = [True if depths[checkpoint] >= (args.depth * 0.5) else False for checkpoint in checkpoints_under_both_segments]
         
         if not all(checkpoints_achieved_required_depth):
             outfile.write(segment)
-            for checkpoint in checkpoints_under_segment:
+            reads_written += 1
+            outfile.write(mate_segment)
+            reads_written += 1
+            for checkpoint in checkpoints_under_both_segments:
                 depths[checkpoint] += 1
+        else:
+             reads_discarded += 2
 
-    checkpoint_depths = [depths[checkpoint] for checkpoint in checkpoints]
-    # print(json.dumps(checkpoint_depths))
+        reads_processed += 2
 
+        if reads_processed % 10000 == 0:
+            genome_checkpoint_depths = [depths[checkpoint] for checkpoint in genome_checkpoints]
+            genome_checkpoints_achieved_required_depth = [True if depth >= (args.depth * 0.5) else False for depth in genome_checkpoint_depths]
+            if all(genome_checkpoints_achieved_required_depth):
+                break
+
+    print("reads processed: " + str(reads_processed), file=sys.stderr)
+    print("reads written: " + str(reads_written), file=sys.stderr)
+    print("reads discarded: " + str(reads_discarded), file=sys.stderr)
     # close up the file handles
     infile.close()
     outfile.close()
-    if args.report:
-        reportfh.close()
 
 
 if __name__ == "__main__":
 
     parser = argparse.ArgumentParser(description='Downsample alignments from an amplicon scheme.')
-    parser.add_argument('bedfile', help='BED file containing the amplicon scheme')
-    parser.add_argument('--depth', type=int, help='Subsample to n coverage')
-    parser.add_argument('--no-read-groups', dest='no_read_groups',
-                        action='store_true', help='Do not divide reads into groups in SAM output')
-    parser.add_argument('--report', type=str, help='Output report to file')
-    parser.add_argument('--num-amplicon-subdivisions', type=int, default=3, help='How many times to divide amplicons to detect coverage')
-    parser.add_argument('--remove-incorrect-pairs', action='store_true')
+    parser.add_argument('bam', help='bam file containing the alignment')
+    parser.add_argument('--bed', help='BED file containing the amplicon scheme')
+    parser.add_argument('--depth', type=int, default=200, help='Subsample to n coverage')
+    parser.add_argument('--mapping-quality', type=int, default=20, help='Minimum mapping quality to include read in output')
+    parser.add_argument('--amplicon-subdivisions', type=int, default=3, help='How many times to divide amplicons to detect coverage')
     parser.add_argument('--verbose', action='store_true', help='Debug mode')
     args = parser.parse_args()
     main(args)
